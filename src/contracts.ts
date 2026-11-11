@@ -43,6 +43,14 @@ export interface SteeringEnqueueResult {
     | "invalid_event";
 }
 
+export interface SteeringSendResult {
+  readonly status:
+    | SteeringEnqueueResult["status"]
+    | "invalid_target"
+    | "not_open"
+    | "generation_conflict";
+}
+
 export type SteeringClaimResult =
   | { readonly status: "claimed"; readonly batch: SteeringBatch }
   | {
@@ -60,10 +68,16 @@ export interface SteeringTarget {
     outcome: SteeringOutcome,
   ): "settled" | "stale" | "invalid_outcome";
   seal(): "sealed" | "closed";
-  /** Close the handle and return the number of buffered, unsettled events discarded. */
+  /** Close the handle and count accepted events never finalized as committed or unknown, including expired events. */
   close(): number;
 }
 
 export interface SteeringInbox {
   open(targetId: string, generation: string): SteeringOpenResult;
+  /** Enqueue on an existing target without opening it. */
+  enqueue(
+    targetId: string,
+    generation: string,
+    event: SteeringEvent,
+  ): SteeringSendResult;
 }

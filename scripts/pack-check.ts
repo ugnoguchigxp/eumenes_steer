@@ -25,6 +25,7 @@ try {
   if (!archive.success) throw new Error(archive.stderr.toString());
   const files = archive.stdout.toString().trim().split("\n").sort();
   const expected = [
+    "package/LICENSE",
     "package/README.md",
     "package/package.json",
     "package/src/contracts.ts",
@@ -60,6 +61,8 @@ try {
         moduleResolution: "Bundler",
         lib: ["ES2022", "DOM"],
         strict: true,
+        exactOptionalPropertyTypes: true,
+        verbatimModuleSyntax: true,
         noUncheckedIndexedAccess: true,
         noEmit: true,
         types: [],

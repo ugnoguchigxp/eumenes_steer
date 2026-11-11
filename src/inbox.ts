@@ -32,7 +32,8 @@ function settings(options: SteeringInboxOptions) {
     "maxFieldBytes",
     options.maxFieldBytes ?? 256,
   );
-  const now = options.now ?? Date.now;
+  const { now = Date.now } = options;
+  if (typeof now !== "function") throw new TypeError("now must be a function");
   return {
     maxTtlMs,
     defaultTtlMs,
@@ -68,8 +69,12 @@ type StoredEvent = SteeringBatch["events"][number];
 
 function createTarget(config: Settings, onClose: () => void): SteeringTarget {
   // Keep accepted IDs for the lifetime of the handle, including after expiry.
-  const seen = new Map<string, SteeringEvent>();
+  const seen = new Map<
+    string,
+    Pick<SteeringEvent, "sourceRef" | "sourceRevision">
+  >();
   const settled = new Set<string>();
+  let finalizedCount = 0;
   let pending = new Map<string, StoredEvent>();
   let active: { boundaryId: string; batch: SteeringBatch } | undefined;
   let retry: { boundaryId: string; eventIds: readonly string[] } | undefined;
@@ -87,13 +92,11 @@ function createTarget(config: Settings, onClose: () => void): SteeringTarget {
       if (state !== "open") return { status: state };
       if (!event || typeof event !== "object")
         return { status: "invalid_event" };
-      const { id, sourceRef, sourceRevision, expiresAt } = event;
+      const { id, sourceRef, sourceRevision } = event;
       if (
         !config.validField(id) ||
         !config.validField(sourceRef) ||
-        !config.validField(sourceRevision) ||
-        (expiresAt !== undefined &&
-          (!Number.isSafeInteger(expiresAt) || expiresAt < 0))
+        !config.validField(sourceRevision)
       ) {
         return { status: "invalid_event" };
       }
@@ -101,9 +104,15 @@ function createTarget(config: Settings, onClose: () => void): SteeringTarget {
       if (original) {
         const same =
           original.sourceRef === sourceRef &&
-          original.sourceRevision === sourceRevision &&
-          original.expiresAt === expiresAt;
+          original.sourceRevision === sourceRevision;
         return { status: same ? "duplicate" : "conflict" };
+      }
+      const { expiresAt } = event;
+      if (
+        expiresAt !== undefined &&
+        (!Number.isSafeInteger(expiresAt) || expiresAt < 0)
+      ) {
+        return { status: "invalid_event" };
       }
       const time = config.now();
       const deadline = Math.min(
@@ -120,7 +129,7 @@ function createTarget(config: Settings, onClose: () => void): SteeringTarget {
         return { status: "pending_limit" };
       }
       if (seen.size >= config.maxEvents) return { status: "event_limit" };
-      seen.set(id, { id, sourceRef, sourceRevision, expiresAt });
+      seen.set(id, { sourceRef, sourceRevision });
       pending.set(
         id,
         Object.freeze({ id, sourceRef, sourceRevision, expiresAt: deadline }),
@@ -176,6 +185,7 @@ function createTarget(config: Settings, onClose: () => void): SteeringTarget {
         retry = { boundaryId, eventIds: batch.events.map((event) => event.id) };
       } else {
         settled.add(boundaryId);
+        finalizedCount += batch.events.length;
       }
       active = undefined;
       return "settled";
@@ -189,7 +199,7 @@ function createTarget(config: Settings, onClose: () => void): SteeringTarget {
 
     close() {
       if (state === "closed") return 0;
-      const discarded = pending.size + (active?.batch.events.length ?? 0);
+      const discarded = seen.size - finalizedCount;
       state = "closed";
       remove?.();
       remove = undefined;
@@ -212,9 +222,11 @@ export function createSteeringInbox(
     string,
     { generation: string; target: SteeringTarget }
   >();
+  const validTarget = (targetId: string, generation: string) =>
+    config.validField(targetId) && config.validField(generation);
   return {
     open(targetId, generation) {
-      if (!config.validField(targetId) || !config.validField(generation)) {
+      if (!validTarget(targetId, generation)) {
         return { status: "invalid_target" };
       }
       const existing = targets.get(targetId);
@@ -227,6 +239,15 @@ export function createSteeringInbox(
       const target = createTarget(config, () => targets.delete(targetId));
       targets.set(targetId, { generation, target });
       return { status: "opened", target };
+    },
+    enqueue(targetId, generation, event) {
+      if (!validTarget(targetId, generation))
+        return { status: "invalid_target" };
+      const existing = targets.get(targetId);
+      if (!existing) return { status: "not_open" };
+      if (existing.generation !== generation)
+        return { status: "generation_conflict" };
+      return existing.target.enqueue(event);
     },
   };
 }

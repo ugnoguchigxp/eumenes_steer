@@ -17,9 +17,9 @@
 
 ## 2. Inbox と推論への引き渡し
 
-`eumenes-steer` は、Bunで使う実行時依存ゼロのライブラリとする。TGZには `package.json`、README、InboxのTypeScriptソースを収録し、公開入口は `eumenes-steer` の1つ。`createSteeringInbox` と公開型を提供する。導入先は任意の文字列IDで実行と出典を対応づけ、自分のモデル入力境界で取得・確定する。以下のEumenes固有の配線、出典検証、推論受理の通知は、導入先のコードとして実装する。 [配布仕様](plan.md#5-構成と配布)
+`eumenes-steer` は、Bunで使う実行時依存ゼロのライブラリとする。TGZには `package.json`、README、`LICENSE`、InboxのTypeScriptソースを収録し、公開入口は `eumenes-steer` の1つ。`createSteeringInbox` と公開型を提供する。導入先は任意の文字列IDで実行と出典を対応づけ、自分のモデル入力境界で取得・確定する。以下のEumenes固有の配線、出典検証、推論受理の通知は、導入先のコードとして実装する。 [配布仕様](plan.md#5-構成と配布)
 
-`server-services.ts` で Inbox を一つ生成し、Dialogue と `createToolchain` 内の Pursuit に渡す。対象 ID はホストで `dialogue:<runId>` と `pursuit:<runId>` に名前空間を分ける。送信側はホストが検証した対象への登録だけを行い、受信側は対象を開閉してバッチを取得する。Core は同一プロセス内の順序、期限、重複、取得権だけを管理する。本文と権限は各ドメインの正本に置く。 [サーバー構成](../eumenes/api/application/server-services.ts) · [Pursuit の組み立て](../eumenes/api/application/toolchain/toolchain.ts#L416)
+`server-services.ts` で Inbox を一つ生成し、Dialogue と `createToolchain` 内の Pursuit に渡す。対象 ID はホストで `dialogue:<runId>` と `pursuit:<runId>` に名前空間を分ける。送信側にはホストが検証した対象への `inbox.enqueue` だけを渡し、受信側は対象を開閉してバッチを取得する。Core は同一プロセス内の順序、期限、重複、取得権だけを管理する。本文と権限は各ドメインの正本に置く。 [サーバー構成](../eumenes/api/application/server-services.ts) · [Pursuit の組み立て](../eumenes/api/application/toolchain/toolchain.ts#L416)
 
 ~~~text
 既存 writer が出典と版を確定
@@ -33,13 +33,14 @@
 
 | 操作 | 初回の契約 |
 | --- | --- |
-| `open(targetId, generation)` | 現在の対象のハンドルを発行。同じ世代の二重 open は既存ハンドルを返す。異なる世代が開いている場合は拒否し、ホストが旧世代を閉じてから開く。ハンドルの識別子も照合するため、同じキーを開き直しても旧ハンドルから操作できない |
-| `enqueue(event)` | `id`、`sourceRef`、`sourceRevision`、任意の絶対時刻 `expiresAt` を受理。受付順を割り当て、受理・重複・同 ID 衝突・期限切れ・上限・締切後・旧世代を区別する。再送で TTL を延ばさない |
+| `open(targetId, generation)` | 現在の対象のハンドルを発行。同じ世代の二重 open は既存ハンドルを返す。異なる世代が開いている場合は拒否し、ホストが旧世代を閉じてから開く。同じキーを開き直しても旧ハンドルは失効したまま。閉じた世代や古い世代の開き直しはホストが防ぐ |
+| `inbox.enqueue(targetId, generation, event)` | 開いている対象へ登録する。未開設・閉鎖済みは `not_open`、世代不一致は `generation_conflict`、不正な識別子は `invalid_target` |
+| `target.enqueue(event)` | `id`、`sourceRef`、`sourceRevision`、任意の絶対時刻 `expiresAt` を受理。受付順を割り当て、受理・重複・同 ID 衝突・期限切れ・上限・締切後・旧世代を区別する。同じIDは出典と版で照合し、最初の期限を維持する |
 | `claim(boundaryId)` | 受付順の非空スナップショットと一意な `batchId` を返す。空、取得中、確定済み境界を区別する。取得中の追加は次の境界へ回る |
 | `settle(batchId, outcome)` | `committed` と `unknown` は対象イベントを保留から除き、境界を閉じる。`released` は再取得可能。同じ境界の再取得は元の集合と順序を維持し、新トークンを発行する。別の境界へ進めば未引き渡し分を新着と受付順で取得する。失効・期限切れ分は解決時に除く。古い取得権・二重確定は状態を変えない |
-| `seal()` / `close()` | `seal` 後も保留分を取得できる。`close` は保留・取得中の未確定分を数えて破棄し、ハンドルを失効させる。正本へ残ったメッセージ、制作条件、作業結果は既存経路から再利用できる |
+| `seal()` / `close()` | `seal` 後も保留分を取得できる。`close` は受理件数から `committed`・`unknown` で確定した件数を引いて返し、ハンドルを失効させる。期限切れも計数する。正本へ残ったメッセージ、制作条件、作業結果は既存経路から再利用できる |
 
-上限は `plan.md` の対象256件、保留32件、異なるID累計512件、文字列ごとに256 UTF-8バイト、TTL最大10分を採用する。保留枠には取得中を含め、期限切れの未取得分は枠の判定前に除く。期限が切れたイベントの ID は世代終了まで重複検出に残す。バッチ中に有効な出典がゼロになった場合は既存入力だけで進め、その入力の受理時にバッチを確定して補足の引き渡し件数をゼロと記録する。正本の一時的な読取失敗、または有効分全体が入力予算に収まらない場合は引き渡し前に `released` とする。個々の出典の状態はホストが記録する。 [上限と期限](plan.md#3-inboxの契約)
+`createSteeringInbox` は時刻関数を受け取る。`now` が関数以外なら生成時に `TypeError`。上限は `plan.md` の対象256件、保留32件、異なるID累計512件、文字列ごとに256 UTF-8バイト、TTL最大10分を採用する。保留枠には取得中を含め、期限切れの未取得分は枠の判定前に除く。期限が切れたイベントの ID は世代終了まで重複検出に残す。バッチ中に有効な出典がゼロになった場合は既存入力だけで進め、その入力の受理時にバッチを確定して補足の引き渡し件数をゼロと記録する。正本の一時的な読取失敗、または有効分全体が入力予算に収まらない場合は引き渡し前に `released` とする。個々の出典の状態はホストが記録する。 [上限と期限](plan.md#3-inboxの契約)
 
 ### 入力確定と受付の観測点
 

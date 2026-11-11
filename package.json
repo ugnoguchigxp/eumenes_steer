@@ -2,6 +2,7 @@
   "name": "eumenes-steer",
   "version": "0.1.0",
   "private": true,
+  "license": "MIT",
   "type": "module",
   "packageManager": "bun@1.4.4",
   "exports": {
@@ -9,7 +10,8 @@
   },
   "files": [
     "src",
-    "README.md"
+    "README.md",
+    "LICENSE"
   ],
   "scripts": {
     "verify": "bun check && bun fmt --check src test example scripts package.json tsconfig.json README.md && oxlint --deny-warnings src test example scripts && bun test ./test",

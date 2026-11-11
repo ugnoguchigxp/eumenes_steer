@@ -106,8 +106,14 @@ describe("steering inbox", () => {
     time = 7;
     expect(target.enqueue(event("a")).status).toBe("duplicate");
     expect(target.enqueue({ ...event("a"), expiresAt: 10 }).status).toBe(
-      "conflict",
+      "duplicate",
     );
+    expect(target.enqueue({ ...event("a"), expiresAt: 100 }).status).toBe(
+      "duplicate",
+    );
+    expect(
+      target.enqueue({ ...event("a"), expiresAt: Number.NaN }).status,
+    ).toBe("duplicate");
     expect(
       target.enqueue({ ...event("a"), sourceRef: "different" }).status,
     ).toBe("conflict");
@@ -116,6 +122,9 @@ describe("steering inbox", () => {
     );
     expect(target.enqueue({ ...event("b"), expiresAt: 100 }).status).toBe(
       "accepted",
+    );
+    expect(target.enqueue({ ...event("b"), expiresAt: 8 }).status).toBe(
+      "duplicate",
     );
     time = 10;
     const batch = claim(target, "step-1");
@@ -217,6 +226,31 @@ describe("steering inbox", () => {
     );
   });
 
+  test("the sender only enqueues on an open target with a matching generation", () => {
+    const inbox = createSteeringInbox({ maxTargets: 1 });
+    const send = inbox.enqueue;
+    expect(send("missing", "1", event("a")).status).toBe("not_open");
+    expect(send(" ", "1", event("a")).status).toBe("invalid_target");
+    expect(send("run", "", event("a")).status).toBe("invalid_target");
+    const target = open(inbox, "run", "2");
+    expect(send("run", "1", event("a")).status).toBe("generation_conflict");
+    expect(send("run", "2", event("a")).status).toBe("accepted");
+    expect(target.enqueue(event("a")).status).toBe("duplicate");
+    expect(send("run", "2", { ...event("b"), sourceRef: "" }).status).toBe(
+      "invalid_event",
+    );
+    target.seal();
+    expect(send("run", "2", event("b")).status).toBe("sealed");
+    expect(target.close()).toBe(1);
+    expect(send("run", "2", event("a")).status).toBe("not_open");
+    expect(open(inbox, "different").close()).toBe(0);
+    // Reopening even an older generation is the host's explicit decision.
+    const reopened = open(inbox, "run", "1");
+    expect(send("run", "2", event("a")).status).toBe("generation_conflict");
+    expect(send("run", "1", event("a")).status).toBe("accepted");
+    expect(ids(claim(reopened, "answer"))).toEqual(["a"]);
+  });
+
   test("sealing preserves pending events for the final boundary and close counts unsettled events", () => {
     const target = open(createSteeringInbox());
     target.enqueue(event("a"));
@@ -235,19 +269,49 @@ describe("steering inbox", () => {
     expect(final.close()).toBe(0);
   });
 
+  test("close counts all unfinalized events, regardless of expiry cleanup", () => {
+    for (const prune of [false, true]) {
+      let time = 0;
+      let clockReads = 0;
+      const target = open(
+        createSteeringInbox({
+          now: () => {
+            clockReads++;
+            return time;
+          },
+        }),
+      );
+      target.enqueue(event("committed"));
+      target.settle(claim(target, "first").id, "committed");
+      target.enqueue(event("unknown"));
+      target.settle(claim(target, "second").id, "unknown");
+      target.enqueue({ ...event("unclaimed"), expiresAt: 2 });
+      target.enqueue({ ...event("released"), expiresAt: 2 });
+      target.settle(claim(target, "third").id, "released");
+      target.enqueue({ ...event("late"), expiresAt: 2 });
+      time = 2;
+      if (prune) expect(target.claim("last").status).toBe("empty");
+      const before = clockReads;
+      expect(target.close()).toBe(3);
+      expect(clockReads).toBe(before);
+      expect(target.close()).toBe(0);
+    }
+  });
+
   test("rejects blank, oversized or malformed fields and invalid configuration", () => {
     const inbox = createSteeringInbox({ maxFieldBytes: 4 });
     expect(inbox.open("abcde", "1").status).toBe("invalid_target");
     expect(inbox.open("run", " ").status).toBe("invalid_target");
     const target = open(inbox);
     expect(target.claim("").status).toBe("invalid_boundary");
+    const valid = { id: "a", sourceRef: "ref", sourceRevision: "1" };
     for (const bad of [
-      { ...event("a"), id: " " },
-      { id: "a", sourceRef: "ああ", sourceRevision: "1" },
-      { id: "a", sourceRef: "ref", sourceRevision: "" },
-      { ...event("a"), expiresAt: -1 },
-      { ...event("a"), expiresAt: Number.NaN },
-      { ...event("a"), expiresAt: 1.5 },
+      { ...valid, id: " " },
+      { ...valid, sourceRef: "ああ" },
+      { ...valid, sourceRevision: "" },
+      { ...valid, expiresAt: -1 },
+      { ...valid, expiresAt: Number.NaN },
+      { ...valid, expiresAt: 1.5 },
     ]) {
       expect(target.enqueue(bad).status).toBe("invalid_event");
     }
@@ -264,5 +328,13 @@ describe("steering inbox", () => {
     );
     const brokenClock = open(createSteeringInbox({ now: () => -1 }));
     expect(() => brokenClock.claim("boundary")).toThrow(RangeError);
+  });
+
+  test("rejects a non-function clock at construction", () => {
+    for (const now of [5, null]) {
+      expect(() =>
+        createSteeringInbox({ now: now as unknown as () => number }),
+      ).toThrow(TypeError);
+    }
   });
 });
